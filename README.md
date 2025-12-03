@@ -8,7 +8,9 @@ cpulimit (Debian: apt-get install cpulimit)
 # usage
 
 #limits process with name vm2 to 10% of CPU
+
 cpulimitname -name "vm2" -limit 10 
 
 #cancel cpulimit
+
 cpulimitname -cancel -name "vm2"
