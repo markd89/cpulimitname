@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+
+# cpulimitname - Apply CPU limits to processes by name
+
+#set -euo pipefail
+
+# Global variables
+NAME=""
+LIMIT=""
+CANCEL=false
+ALL=false
+LIST=false
+VERBOSE=false
+
+#------------------------------------------------------------------------------
+# Help and Logging
+#------------------------------------------------------------------------------
+
+usage() {
+    cat << 'EOF'
+Usage: cpulimitname -name PROCESS_NAME -limit PERCENTAGE [OPTIONS]
+       cpulimitname -cancel -name PROCESS_NAME [OPTIONS]
+       cpulimitname -list
+
+Apply or remove CPU usage limits on processes by name.
+
+REQUIRED (for apply mode):
+  -name NAME       Process name pattern to match
+  -limit PERCENT   CPU limit percentage (0-100)
+
+MODE FLAGS:
+  -cancel          Remove existing CPU limit from matching process(es)
+  -list            Show all active cpulimit processes
+  -all             Apply limit to ALL matching processes (default: first only)
+
+OTHER OPTIONS:
+  -v               Verbose output
+  -h, --help       Show this help message
+
+EXAMPLES:
+  cpulimitname -name "chrome" -limit 30
+  cpulimitname -name "ffmpeg" -limit 50 -all
+  cpulimitname -cancel -name "chrome"
+  cpulimitname -list
+EOF
+}
+
+log_verbose() {
+    [[ "$VERBOSE" == "true" ]] && echo "VERBOSE: $*" >&2
+}
+
+#------------------------------------------------------------------------------
+# Validation and Utilities
+#------------------------------------------------------------------------------
+
+check_requirements() {
+    if ! command -v cpulimit &> /dev/null; then
+        echo "Error: cpulimit command not found. Please install it first." >&2
+        exit 1
+    fi
+}
+
+validate_args() {
+    if [[ "$LIST" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$NAME" ]]; then
+        echo "Error: -name is required" >&2
+        usage
+        exit 1
+    fi
+
+    if [[ "$CANCEL" == "false" ]]; then
+        if [[ -z "$LIMIT" ]]; then
+            echo "Error: -limit is required" >&2
+            usage
+            exit 1
+        fi
+        
+        # Validate limit is integer 0-100
+        if ! [[ "$LIMIT" =~ ^[0-9]+$ ]] || [[ "$LIMIT" -gt 100 ]]; then
+            echo "Error: limit must be an integer between 0 and 100" >&2
+            exit 1
+        fi
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Process Discovery
+#------------------------------------------------------------------------------
+
+find_pids_by_name() {
+    local name="$1"
+    local pids=()
+    log_verbose "find_pids_by_name called with name='$name'"
+    
+    log_verbose "Searching for processes matching '$name'"
+    
+    if command -v pgrep &> /dev/null; then
+        log_verbose "Executing: pgrep -f '$name'"
+        pids=($(pgrep -f "$name" 2>/dev/null || true))
+        log_verbose "pgrep found ${#pids[@]} PIDs: [${pids[*]}]"
+    else
+        local first_char="${name:0:1}"
+        local rest="${name:1}"
+        pids=($(ps axww | grep "[${first_char}]${rest}" | awk '{print $1}' 2>/dev/null || true))
+    fi
+    
+    log_verbose "Final array size: ${#pids[@]}"
+    
+    if [[ "${#pids[@]}" -eq 0 ]]; then
+        log_verbose "No processes found matching '$name'"
+        return 1
+    fi
+    
+    for pid in "${pids[@]}"; do
+        echo "$pid"
+    done
+}
+
+#------------------------------------------------------------------------------
+# cpulimit Detection and Management
+#------------------------------------------------------------------------------
+
+is_cpulimit_running_on_pid() {
+    local target_pid="$1"
+    
+    # Find cpulimit processes that have -p TARGET_PID in their args
+    local cpulimit_pids
+    cpulimit_pids=$(ps -eo pid,args | \
+                    grep "cpulimit" | \
+                    grep -v grep | \
+                    grep -E "\-p[[:space:]]*${target_pid}([[:space:]]|$)" | \
+                    awk '{print $1}' 2>/dev/null || true)
+    
+    [[ -n "$cpulimit_pids" ]]
+}
+
+apply_limit_to_pid() {
+    local pid="$1"
+    local limit="$2"
+    
+    # Verify target PID still exists
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Error: Target PID $pid no longer exists" >&2
+        return 1
+    fi
+    
+    # Check if already limited
+    if is_cpulimit_running_on_pid "$pid"; then
+        echo "Error: cpulimit is already active on PID $pid (use -cancel first)" >&2
+        return 1
+    fi
+    
+    log_verbose "Launching cpulimit: cpulimit -b -l $limit -p $pid"
+    
+    # Run cpulimit in background (it already daemonizes with -b)
+    if cpulimit -b -l "$limit" -p "$pid" 2>/dev/null; then
+        echo "Applied CPU limit of $limit% to PID $pid"
+    else
+        echo "Error: Failed to start cpulimit on PID $pid" >&2
+        return 1
+    fi
+}
+
+list_active_limits() {
+    echo "Active cpulimit processes:"
+    echo "-------------------------"
+    
+    # Get all cpulimit processes and the PIDs they're limiting
+    local found=false
+    ps -eo pid,args 2>/dev/null | grep "cpulimit" | grep -v grep | while read -r line; do
+        local cpid target_pid limit proc_name
+        
+        cpid=$(echo "$line" | awk '{print $1}')
+        limit=$(echo "$line" | grep -oE "\-l[[:space:]]*[0-9]+" | grep -oE "[0-9]+")
+        target_pid=$(echo "$line" | grep -oE "\-p[[:space:]]*[0-9]+" | grep -oE "[0-9]+")
+        
+        if [[ -n "$target_pid" ]] && kill -0 "$target_pid" 2>/dev/null; then
+            proc_name=$(ps -p "$target_pid" -o comm= 2>/dev/null || echo "unknown")
+            echo "cpulimit PID $cpid → target PID $target_pid ($proc_name) at ${limit}%"
+            found=true
+        else
+            echo "cpulimit PID $cpid → stale target PID $target_pid"
+            found=true
+        fi
+    done || true
+    
+    if [[ "$found" == "false" ]]; then
+        echo "No active cpulimit processes found"
+    fi
+}
+
+# CANCEL FUNCTION (standalone, safe)
+cancel_cpulimit_by_name() {
+    local name="$1"
+    local cpulimit_pids=()
+    local cpulimit_lines
+    cpulimit_lines=$(ps -eo pid,args 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]+cpulimit' | grep -v grep || true)
+    log_verbose "Found $(echo "$cpulimit_lines" | wc -l) cpulimit process lines"
+
+    while IFS= read -r line; do
+        log_verbose "Processing line: '$line'"
+        local cpid target_pid
+        cpid=$(echo "$line" | awk '{print $1}')
+        target_pid=$(echo "$line" | grep -oE '\-p[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+        
+        if [[ -n "$target_pid" ]]; then
+            if command -v pgrep &> /dev/null; then
+                local pgrep_out
+                pgrep_out=$(pgrep -f "$name" 2>/dev/null || true)
+                if echo "$pgrep_out" | grep -q "^${target_pid}$"; then
+                    cpulimit_pids+=("$cpid")
+                fi
+            else
+                local target_proc_name
+                target_proc_name=$(ps -p "$target_pid" -o args= 2>/dev/null || echo "")
+                if [[ -n "$target_proc_name" ]]; then
+                    local first_char="${name:0:1}"
+                    local rest="${name:1}"
+                    if echo "$target_proc_name" | grep -q "[${first_char}]${rest}" 2>/dev/null; then
+                        cpulimit_pids+=("$cpid")
+                    fi
+                fi
+            fi
+        fi
+    done <<< "$cpulimit_lines"
+    
+    log_verbose "Array size after loop: ${#cpulimit_pids[@]}"
+
+    if [[ "${#cpulimit_pids[@]}" -eq 0 ]]; then
+        echo "Error: No cpulimit processes found targeting processes matching '$name'" >&2
+        return 1
+    fi
+    
+    log_verbose "Found ${#cpulimit_pids[@]} cpulimit process(es) to cancel"
+    
+    for cpid in "${cpulimit_pids[@]}"; do
+        log_verbose "Sending SIGTERM to cpulimit PID $cpid"
+        if kill -TERM "$cpid" 2>/dev/null; then
+            echo "Cancelled cpulimit PID $cpid"
+        else
+            echo "Warning: Failed to kill cpulimit PID $cpid (permission denied?)" >&2
+        fi
+    done
+}
+
+#------------------------------------------------------------------------------
+# Main Logic
+#------------------------------------------------------------------------------
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -name)
+                NAME="$2"
+                shift 2
+                ;;
+            -limit)
+                LIMIT="$2"
+                shift 2
+                ;;
+            -cancel)
+                CANCEL=true
+                shift
+                ;;
+            -all)
+                ALL=true
+                shift
+                ;;
+            -list)
+                LIST=true
+                shift
+                ;;
+            -v)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Validate and setup
+    check_requirements
+    validate_args
+    
+    # Handle list mode
+    if [[ "$LIST" == "true" ]]; then
+        list_active_limits
+        exit 0
+    fi
+    
+    if [[ "$CANCEL" == "true" ]]; then
+        cancel_cpulimit_by_name "$NAME"
+        exit 0
+    fi
+    
+    # NORMAL APPLY MODE - FIXED: no process sub fragility
+    local pids=($(find_pids_by_name "$NAME" 2>/dev/null || true))
+    
+    if [[ "${#pids[@]}" -eq 0 ]]; then
+        echo "Error: No processes found matching '$NAME'" >&2
+        exit 1
+    fi
+    
+    log_verbose "Found ${#pids[@]} matching process(es): ${pids[*]}"
+    
+    # Warn if multiple found but -all not specified
+    if [[ "${#pids[@]}" -gt 1 && "$ALL" == "false" ]]; then
+        echo "Warning: Multiple processes match '$NAME'. Using PID ${pids[0]} only." >&2
+        echo "         Use -all to affect all matches, or refine the pattern." >&2
+    fi
+    
+    # Process each PID
+    local pids_to_process=()
+    if [[ "$ALL" == "true" ]]; then
+        pids_to_process=("${pids[@]}")
+    else
+        pids_to_process=("${pids[0]}")
+    fi
+    
+    for pid in "${pids_to_process[@]}"; do
+        apply_limit_to_pid "$pid" "$LIMIT"
+    done
+}
+
+# Run main
+main "$@"
